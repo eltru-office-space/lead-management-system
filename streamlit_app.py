@@ -17,9 +17,25 @@ def is_valid_uuid(val):
 
 def load_companies():
     response = supabase.table("companies").select(
-        "id, name, industry, city, source, sf_occupied, lease_expiration, future_move, created_at"
+        "id, name, industry, city, source, state, sf_occupied, lease_expiration, future_move, created_at"
     ).execute()
-    return pd.DataFrame(response.data)
+    df = pd.DataFrame(response.data)
+
+    # Clean string columns
+    for col in ["state", "name", "industry", "city", "source"]:
+        df[col] = df[col].astype(str).str.strip().replace("nan", "")
+
+    # Clean sf_occupied safely
+    def safe_parse_sf(value):
+        try:
+            return float(str(value).replace(",", "").strip())
+        except:
+            return None
+
+    df["sf_occupied"] = df["sf_occupied"].apply(safe_parse_sf)
+
+    return df
+
 
 def company_list_view():
     st.set_page_config(page_title="Company List", layout="wide")
@@ -27,61 +43,115 @@ def company_list_view():
 
     df = load_companies()
 
-    # Global search filter
+    # --- Global search filter ---
     search_term = st.text_input("Search by company name")
     if search_term:
         df = df[df['name'].str.contains(search_term, case=False, na=False)]
 
-    # Industry filter
+    # --- Industry filter ---
     df['industry'] = df['industry'].fillna("Unknown")
-    industries = df['industry'].unique().tolist()
+    industries = sorted(df['industry'].unique().tolist())
     selected_industry = st.selectbox("Filter by Industry", ["All"] + industries)
     if selected_industry != "All":
         df = df[df['industry'] == selected_industry]
 
-    # Source filter
+    # --- Source filter ---
     df['source'] = df['source'].fillna("Unknown")
-    source = df['source'].unique().tolist()
-    selected_source = st.selectbox("Filter by Source", ["All"] + source)
+    sources = sorted(df['source'].unique().tolist())
+    selected_source = st.selectbox("Filter by Source", ["All"] + sources)
     if selected_source != "All":
         df = df[df['source'] == selected_source]
 
-    # Lease expiration filter
-    df['lease_expiration'] = pd.to_datetime(df['lease_expiration'], errors='coerce')
+    # --- State filter (normalize & trim, keep 'Unknown') ---
+    df["state"] = (
+        df["state"]
+        .astype(str)
+        .str.replace("\u00A0", " ", regex=False)  # remove non-breaking spaces
+        .str.strip()
+    )
+    df["state"] = df["state"].where(df["state"] != "", "Unknown")
+    states = sorted([s for s in df["state"].unique().tolist() if s])
+    selected_state = st.selectbox("Filter by State", ["All"] + states)
+    if selected_state != "All":
+        df = df[df["state"] == selected_state]
 
-# Handle case when all values are NaT
-    if df['lease_expiration'].notna().any():
-        lease_min = df['lease_expiration'].min()
-        lease_max = df['lease_expiration'].max()
+    # --- SF Occupied slider (filter on numeric helper, display original) ---
+    # Build a numeric helper column; keep original 'sf_occupied' for display
+    df["sf_occupied_num"] = (
+        df["sf_occupied"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+    df["sf_occupied_num"] = pd.to_numeric(df["sf_occupied_num"], errors="coerce")
+
+    if df["sf_occupied_num"].notna().any():
+        sf_min_value = int(df["sf_occupied_num"].min() // 1000 * 1000)
+        sf_max_value = int(df["sf_occupied_num"].max() // 1000 * 1000 + 1000)
+        sf_min, sf_max = st.slider(
+            "Select SF Occupied range:",
+            min_value=sf_min_value,
+            max_value=sf_max_value,
+            value=(sf_min_value, sf_max_value),
+            step=1000,
+        )
+        df = df[(df["sf_occupied_num"] >= sf_min) & (df["sf_occupied_num"] <= sf_max)]
+
+    # --- Lease expiration filter (INCLUDE NaT rows) ---
+    df["lease_expiration"] = pd.to_datetime(df["lease_expiration"], errors="coerce")
+    if df["lease_expiration"].notna().any():
+        lease_min = df["lease_expiration"].min()
+        lease_max = df["lease_expiration"].max()
     else:
-        # Fallback default range
         lease_min = pd.Timestamp("2000-01-01")
         lease_max = pd.Timestamp.today()
 
-    lease_date_range = st.date_input(
-    "Lease Expiration between",
-    [lease_min, lease_max]
-    )
+    lease_date_range = st.date_input("Lease Expiration between", [lease_min, lease_max])
 
+    # Allow rows with no lease_expiration to pass
+    start_dt = pd.to_datetime(lease_date_range[0])
+    end_dt = pd.to_datetime(lease_date_range[1])
+    lease_mask = df["lease_expiration"].isna() | (
+        (df["lease_expiration"] >= start_dt) & (df["lease_expiration"] <= end_dt)
+    )
+    df = df[lease_mask]
+
+    # --- Show result ---
     if df.empty:
         st.warning("No companies found with the selected filters.")
-    else:
-        # Format clickable company names
-        df['name'] = df.apply(
-            lambda row: f'<a href="/company_detail?company_id={row["id"]}">{row["name"]}</a>',
-            axis=1
-        )
+        return
 
-        # Format date columns
-        df['lease_expiration'] = df['lease_expiration'].dt.strftime('%Y-%m-%d')
-        df['future_move'] = pd.to_datetime(df['future_move'], errors='coerce').dt.strftime('%Y-%m-%d')
+    # Clickable company names
+    df["name"] = df.apply(
+        lambda row: f'<a href="/company_detail?company_id={row["id"]}">{row["name"]}</a>',
+        axis=1,
+    )
 
-        # Show table with clickable links
-        st.markdown(
-            df[['name', 'industry', 'city', 'source', 'lease_expiration', 'future_move', 'sf_occupied', 'created_at']]
-            .to_html(escape=False, index=False),
-            unsafe_allow_html=True
-        )
+    # Format dates
+    df["lease_expiration"] = df["lease_expiration"].dt.strftime("%Y-%m-%d")
+    df["future_move"] = pd.to_datetime(df["future_move"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # Drop helper column before display
+    if "sf_occupied_num" in df.columns:
+        df = df.drop(columns=["sf_occupied_num"])
+
+    # Display final table
+    st.markdown(
+        df[
+            [
+                "name",
+                "industry",
+                "city",
+                "source",
+                "state",
+                "lease_expiration",
+                "future_move",
+                "sf_occupied",
+                "created_at",
+            ]
+        ].to_html(escape=False, index=False),
+        unsafe_allow_html=True,
+    )
 
 def company_detail_view(company_id):
     st.title("🔍 Company Details")
