@@ -2,3 +2,4 @@ streamlit
 pandas
 supabase
 python-dotenv
+streamlit-aggrid==0.4.0
